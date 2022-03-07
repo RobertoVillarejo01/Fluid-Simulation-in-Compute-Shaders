@@ -1,0 +1,186 @@
+#version 430
+
+layout (local_size_x = 64) in;
+
+struct Particle
+{
+   vec3  position;
+   float density_constraint;
+   vec4  debug_color;
+   vec3  velocity;
+   float lambda;
+   vec3  tentative_position;
+   float pad;
+};
+struct CellData {
+   uint count;
+   uint offset;
+   uint _pad1;
+   uint _pad2;
+};
+
+/*  The buffers that hold all the particle/fluid data.
+   The input one is meant to be read only.
+   The output one is to be write only.
+   Later we will decide on a policy for work groups  */
+
+layout (std140, binding = 0) readonly buffer inputFluidData
+{
+   Particle data[];
+} inData;
+
+layout (std140, binding = 1) writeonly buffer outputFluidData
+{
+   Particle data[];
+} outData;
+
+layout (std140, binding = 2) readonly buffer outputCellData
+{
+   uvec4 offsets;
+   CellData data[];
+} grid;
+        
+
+
+
+
+layout (location = 0) uniform float mParticleRadius;
+layout (location = 1) uniform float mKernelRadius;
+layout (location = 2) uniform vec3  ContainerPos;
+layout (location = 3) uniform vec3  ContainerSize;
+layout (location = 4) uniform float mParticleMass;
+layout (location = 5) uniform float mBaseDensity;
+layout (location = 6) uniform float mBoundaryDensity;
+layout (location = 7) uniform float mRelaxParameter;
+layout (location = 8) uniform float mCorrectionCoef;
+layout (location = 9) uniform float mCorrectionExp;
+layout (location = 10) uniform uint mMaxParticles;
+layout (location = 11) uniform float poly6_coef;
+layout (location = 12) uniform float spiky_coef;
+layout (location = 13) uniform vec3  mGravityForce;
+layout (location = 14) uniform uint  mCellCount;
+layout (location = 15) uniform uint  mParticleCount;
+layout (location = 16) uniform float viscosity_coef;
+layout (location = 17) uniform float lagrangian_viscosity_coef;
+
+const float PI = 3.141592;
+const float dt = 0.016;
+
+
+/* KERNEL COMPUTATIONS */
+
+float poly6(vec3 p_i, vec3 p_j)
+{
+    if (length(distance(p_i, p_j)) > mKernelRadius) {
+        return 0.0f;
+    }
+    else {
+        float h2 = mKernelRadius * mKernelRadius;
+        float r2 = dot(p_i - p_j, p_i - p_j);
+        return poly6_coef * (h2 - r2) * (h2 - r2) * (h2 - r2);
+    }
+}
+
+float viscosity(float r)
+{
+    if (r > mKernelRadius || r < 1e-4) {
+        return 0.0f;
+    }
+    else {
+        float h = mKernelRadius;
+        return viscosity_coef * (-r*r*r / (2*h*h*h) + r*r / (h*h) + h / (2*r) - 1);
+    }
+}
+
+float lagrangian_viscosity(float r)
+{
+    if (r > mKernelRadius || r < 1e-4) {
+        return 0.0;
+    }
+    else {
+        float h = mKernelRadius;
+        return lagrangian_viscosity_coef * (h-r);
+    }
+}
+
+
+
+
+
+/* OTHER HELPER FUNCTIONS */
+
+ivec3 CellCoords(in vec3 pos)
+{
+    return ivec3(floor(pos / mKernelRadius));
+}
+uint CellIdx(in ivec3 coords)
+{
+    return (coords.z * 73856093 +
+            coords.y * 83492791 +
+           coords.x * 19349663) % mCellCount;
+}
+
+uint CheckedNeighbors[27];
+uint CheckedNeighborCount = 0;
+
+bool IsNeighborAlreadyVisited(uint idx)
+{
+    // Need to check if any of the previously checked neighbors is the same to the current 
+    //one (due to hashing and the limited nature of the cell count, imagine cell count of 
+    // 1, all 27 cells involving each particle would be the exact same)
+    for (uint i = 0; i < CheckedNeighborCount; ++i)
+    {
+        if (CheckedNeighbors[i] == idx)
+            return true;
+    }
+
+    // If we reached this points is because there were no duplicates
+    CheckedNeighbors[CheckedNeighborCount] = idx;
+    CheckedNeighborCount++;
+    return false;
+}
+
+
+void main(void)
+{
+    // Get the particle we will be working with in this invocation (make sure it is a valid one)
+    uint mParticleIdx = gl_GlobalInvocationID.x;
+    if (mParticleIdx > mParticleCount) return;
+    Particle p = inData.data[mParticleIdx];
+ 
+ 
+    vec3 viscosity_acc = vec3(0.0);
+    ivec3 cell_coords = CellCoords(p.tentative_position);
+ 
+    for (int a = -1; a <= 1; ++a)
+    for (int b = -1; b <= 1; ++b)
+    for (int c = -1; c <= 1; ++c) 
+    {
+        // Compute the coords of the neighbor
+        ivec3 n_coords = cell_coords + ivec3(a,b,c);
+        uint  n_idx = CellIdx(n_coords);
+
+        // Make sure that the idx is not duplicated
+        if (IsNeighborAlreadyVisited(n_idx))
+            continue;
+
+        // Get the particles in that cell (and iterate through them)
+        CellData n_cell = grid.data[n_idx];
+        uint start = n_cell.offset;
+        uint end   = start + n_cell.count;
+        for (uint j = start; j < end; ++j)
+        {
+            Particle pj = inData.data[j];
+            vec3 rel_pos = p.tentative_position - pj.tentative_position;
+            vec3 rel_vel = pj.velocity - p.velocity;
+            viscosity_acc += rel_vel * poly6(p.tentative_position, pj.tentative_position);
+        }
+    }
+ 
+    // Final velocity and position
+    p.velocity = p.velocity + 0.01 * viscosity_acc;
+    p.position = p.tentative_position;
+ 
+    // Submit this final version of the particle
+    outData.data[mParticleIdx] = p;
+}

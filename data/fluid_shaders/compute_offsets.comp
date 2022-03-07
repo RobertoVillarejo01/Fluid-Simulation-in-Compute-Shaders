@@ -1,0 +1,94 @@
+#version 430
+
+struct Particle
+{
+    vec3  position;
+    float density_constraint;
+    vec4  debug_color;
+    vec3  velocity;
+    float lambda;
+    vec3  tentative_position;
+    uint  cell_offset;
+};
+struct ParticleCellOut {
+    uint count;
+    uint offset;
+    uint _pad1;
+    uint _pad2;
+};
+
+layout (std140, binding = 0) buffer outputCellData
+{
+    uvec4 offsets;
+    ParticleCellOut data[];
+} outCells;
+
+layout (local_size_x = 64) in;
+layout (location = 0) uniform float mKernelRadius;
+layout (location = 1) uniform uint  mParticleCount;
+layout (location = 2) uniform uint  mCellCount;
+
+const float dt = 0.016;
+
+ivec3 CellCoords(in vec3 pos)
+{
+    return ivec3(floor(pos / mKernelRadius));
+}
+uint CellIdx(in ivec3 coords)
+{
+    return (coords.z * 73856093 +
+            coords.y * 83492791 +
+            coords.x * 19349663) % mCellCount;
+}
+
+// A function to compute where this instance should start and end 
+// in an array of length "total_size" so that its evenly distributed 
+// for the whole workgroup
+void ComputeBoundary(uint total_size, out uint start, out uint end)
+{
+    // There will be partitions with 1 extra elements, this will be placed atan
+    // the start. As an example, picture trying to divide 27 elements in 8 boxes:
+    // |4|4|4|3|3|3|3|3|
+    // Where elements 0 to 3 are in the first box, 4 to 7 in the second...
+
+    // The quot will be the number of elements per partition by default and the quot
+    // the number of partitions with one extra element
+    // quot = 27/8 = 3;        
+    // rest = 27%8 = 3;
+    uint quot = total_size / (gl_WorkGroupSize.x * gl_NumWorkGroups.x);
+    uint rest = total_size % (gl_WorkGroupSize.x * gl_NumWorkGroups.x);
+    uint curr = gl_GlobalInvocationID.x;
+    
+    // Also, picture we are trying to compute the values for the cell 3:
+    // |4|4|4|3|3|3|3|3|
+    //      ^            
+    // If all cell with extra elements have already been filled
+    if (curr >= rest) {
+        start = rest * (quot + 1) + (curr - rest) * quot;
+        end = start + quot;
+    }
+    // If there are cells left to fill
+    else {
+        start = curr * (quot + 1);
+        end = start + quot + 1;
+    }
+}
+
+void main(void)
+{
+    uint start, end;
+    ComputeBoundary(mCellCount, start, end);
+    for (uint i = start; i < end; ++i) {
+        // AtomicAdd modifies the first value ("offsets", which was originally 0) and returns 
+        // its value prior to the addition. Therefore we are going to set to the current cell
+        // of shared data the idx of the particle array at which the cell starts while geting
+        // ready in "offsets" the new value for the next cell to read. (sD = sharedData)
+        // Initially: 
+        //   - offsets = where last registered cell ends
+        // After the operation:
+        //   - offsets = where this cell ends (last cell + this count)
+        //   - sD[idx].offset = where this cell starts
+        //   - sD[idx].count  = number of particles
+        outCells.data[i].offset = atomicAdd(outCells.offsets.x, outCells.data[i].count);
+    }
+}

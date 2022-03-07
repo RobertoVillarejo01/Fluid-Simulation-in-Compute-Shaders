@@ -1,0 +1,214 @@
+#version 430
+
+layout (local_size_x = 64) in;
+
+struct Particle
+{
+    vec3  position;
+    float density_constraint;
+    vec4  debug_color;
+    vec3  velocity;
+    float lambda;
+    vec3  tentative_position;
+    float pad;
+};
+struct CellData {
+    uint count;
+    uint offset;
+    uint _pad1;
+    uint _pad2;
+};
+
+/*  The buffers that hold all the particle/fluid data.
+    The input one is meant to be read only.
+    The output one is to be write only.
+    Later we will decide on a policy for work groups  */
+
+layout (std140, binding = 0) readonly buffer inputFluidData
+{
+    Particle data[];
+} inData;
+
+layout (std140, binding = 1) writeonly buffer outputFluidData
+{
+    Particle data[];
+} outData;
+
+layout (std140, binding = 2) readonly buffer outputCellData
+{
+    uvec4 offsets;
+    CellData data[];
+} grid;
+         
+
+
+
+
+layout (location = 0) uniform float mParticleRadius;
+layout (location = 1) uniform float mKernelRadius;
+layout (location = 2) uniform vec3  ContainerPos;
+layout (location = 3) uniform vec3  ContainerSize;
+layout (location = 4) uniform float mParticleMass;
+layout (location = 5) uniform float mBaseDensity;
+layout (location = 6) uniform float mBoundaryDensity;
+layout (location = 7) uniform float mRelaxParameter;
+layout (location = 8) uniform float mCorrectionCoef;
+layout (location = 9) uniform float mCorrectionExp;
+layout (location = 10) uniform uint mMaxParticles;
+layout (location = 11) uniform float poly6_coef;
+layout (location = 12) uniform float spiky_coef;
+layout (location = 13) uniform vec3  mGravityForce;
+layout (location = 14) uniform uint  mCellCount;
+layout (location = 15) uniform uint  mParticleCount;
+
+const float PI = 3.141592;
+const float dt = 0.016;
+
+
+/* KERNEL COMPUTATIONS */
+
+float poly6(vec3 p_i, vec3 p_j)
+{
+    if (length(distance(p_i, p_j)) > mKernelRadius) {
+        return 0.0f;
+    }
+    else {
+        float h2 = mKernelRadius * mKernelRadius;
+        float r2 = dot(p_i - p_j, p_i - p_j);
+        return poly6_coef * (h2 - r2) * (h2 - r2) * (h2 - r2);
+    }
+}
+
+vec3 spiky(vec3 p_i, vec3 p_j)
+{
+    float r = distance(p_i, p_j);
+    if (r > mKernelRadius || r < 1e-4) {
+        return vec3(0.0f);
+    }
+    else {
+        float h = mKernelRadius;
+        return spiky_coef * (h - r) * (h - r) / r * (p_i - p_j);
+    }
+}
+
+float density_at(float d)
+{
+    float h = mKernelRadius;
+    if (d > h) return 0.f;
+    if (d <= 0.f) return 2 * PI / 3;
+    return (2 * PI / 3) * (h - d) * (h - d) * (h + d);
+}
+
+
+
+
+
+/* OTHER HELPER FUNCTIONS */
+
+ivec3 CellCoords(in vec3 pos)
+{
+    return ivec3(floor(pos / mKernelRadius));
+}
+uint CellIdx(in ivec3 coords)
+{
+    return (coords.z * 73856093 +
+            coords.y * 83492791 +
+            coords.x * 19349663) % mCellCount;
+}
+
+float boundary_density(vec3 pos)
+{
+    vec3 maxC = ContainerPos + ContainerSize / 2.0f;
+    vec3 minC = ContainerPos - ContainerSize / 2.0f;
+
+    return
+        density_at(maxC.x - pos.x) +
+        density_at(pos.x  - minC.x) +
+        density_at(maxC.y - pos.y) +
+        density_at(pos.y  - minC.y) +
+        density_at(maxC.z - pos.z) +
+        density_at(pos.z  - minC.z);
+}
+
+uint CheckedNeighbors[27];
+uint CheckedNeighborCount = 0;
+
+bool IsNeighborAlreadyVisited(uint idx)
+{
+    // Need to check if any of the previously checked neighbors is the same to the current 
+    //one (due to hashing and the limited nature of the cell count, imagine cell count of 
+    // 1, all 27 cells involving each particle would be the exact same)
+    for (uint i = 0; i < CheckedNeighborCount; ++i)
+    {
+        if (CheckedNeighbors[i] == idx)
+            return true;
+    }
+
+    // If we reached this points is because there were no duplicates
+    CheckedNeighbors[CheckedNeighborCount] = idx;
+    CheckedNeighborCount++;
+    return false;
+}
+
+
+void main(void)
+{
+    // Get the particle we will be working with in this invocation (make sure it is a valid one)
+    uint mParticleIdx = gl_GlobalInvocationID.x;
+    if (mParticleIdx > mParticleCount) return;
+    Particle p = inData.data[mParticleIdx];
+
+
+    vec3  acc_gradient = vec3(0.0f);        
+    ivec3 cell_coords = CellCoords(p.tentative_position);
+
+    for (int a = -1; a <= 1; ++a)
+    for (int b = -1; b <= 1; ++b)
+    for (int c = -1; c <= 1; ++c) 
+    {
+        // Compute the coords of the neighbor
+        ivec3 n_coords = cell_coords + ivec3(a,b,c);
+        uint  n_idx = CellIdx(n_coords);
+
+        // Make sure that the idx is not duplicated
+        if (IsNeighborAlreadyVisited(n_idx))
+            continue;
+
+        // Get the particles in that cell (and iterate through them)
+        CellData n_cell = grid.data[n_idx];
+        uint start = n_cell.offset;
+        uint end   = start + n_cell.count;
+        for (uint j = start; j < end; ++j)
+        {
+            Particle pj = inData.data[j];
+            vec3 gradient = spiky(p.tentative_position, pj.tentative_position);
+
+            float corr = mCorrectionCoef * pow(poly6(pj.tentative_position, p.tentative_position) /
+                poly6(vec3(0.0f), vec3(0.577350f * 0.03f)), mCorrectionExp);
+            acc_gradient += (p.lambda + pj.lambda + corr) * gradient;
+        }
+    }
+
+    p.tentative_position += clamp(acc_gradient / mBaseDensity, -0.1f, 0.1f);
+
+    vec3 pos = p.tentative_position;
+    vec3 maxC = ContainerPos + ContainerSize / 2.0f;
+    vec3 minC = ContainerPos - ContainerSize / 2.0f;
+
+    // Update the position directly (with the velocity being updated to the proper vector)
+    vec3 prev = p.position;
+    p.velocity = (pos - prev) * 1.0f / dt;
+
+    // Check if the limit has been hit to swap the velocity on those
+    for (int i = 0; i < 3; ++i)
+        if (pos[i] < minC[i] || pos[i] > maxC[i]) {
+            p.velocity[i] *= -1f;
+        }
+
+    vec3 maxV = vec3(20.0f);
+    p.tentative_position = clamp(pos, minC, maxC);
+    p.velocity = clamp(p.velocity, -maxV, maxV);
+
+    // Submit this final version of the particle
+    outData.data[mParticleIdx] = p;
+}
