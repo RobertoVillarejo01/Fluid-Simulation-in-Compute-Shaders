@@ -10,13 +10,17 @@
 ## Summary
 
 Program built in a C++ Engine from scratch using SDL2, glew, OpenGL, glm and ImGui to name a few.  
+  
+
+This is the final project for my Advanced Rendering Techniques Course at Digipen Bilbao. The idea behind the assignment was to pick a paper of our choosing (related to the course's content) and implement it. In my case, I decided to do pick Fluid Simulation to learn how to work with Compute Shaders in a task where performance is key.   
+
 The physics in the project are following mainly the work in Position Based Fluids. However, I also needed to check some of the predecesor papers: 
 
 >1. Macklin, M., & Müller, M. (2013). Position based fluids. ACM Transactions on Graphics (TOG), 32(4), 1-12.
 >1. Müller, M., Charypar, D., & Gross, M. (2003, July). Particle-based fluid simulation for interactive applications. In Proceedings of the 2003 ACM SIGGRAPH/Eurographics symposium on Computer animation (pp. 154-159).
 >1. Monaghan, J. J. (1992). Smoothed particle hydrodynamics. Annual review of astronomy and astrophysics, 30(1), 543-574.
 
-The details of the implementation were mostly home-brew so I cannot link a specific page to check the ideas. However, some of the key points that may be found interesting:
+The details of the implementation (memory layout, specifics about compute shaders and rendering) were mostly home-brew so I cannot link a specific page to check the ideas. However, some of the key points that may be found interesting:
 
 - The formulas that come from the original SPH (Smoothed particle hydrodynamics) help avoid checking all particles against all others. Instad, each particle should only check against particles in a radius.
 - The particles may be sorted every frame in a uniform grid, based on their location.
@@ -25,6 +29,8 @@ The details of the implementation were mostly home-brew so I cannot link a speci
   - Updating the position of particles & Computing their cell
   - Reordering particle buffers to have particles within a cell contiguous in memory (Check atomicAdd in shaders)
   - Applying the physic equations to all particles
+
+In the images below I am outputting the cell idx as a color in greyscale. As the reader may see, there are a lot of different cells containing few particles, this is ideal to avoid computing the expensive physics formulas as much as possible.
 
 ![This is a alt text.](/docs/CellData1.png "Neighbor data, starting")
 ![This is a alt text.](/docs/CellData2.png "Neighbor data, a bit more advanced")
@@ -233,7 +239,7 @@ for (uint i = start; i < end; ++i)
 
 ## Rendering particles
 
-Instead of rendering particles, in this project I'm rendering quads. A single position is needed to render each quad, so its easy to do so in an instanced way. (Check the IMPORTANT line)
+Instead of rendering particles, in this project I'm rendering quads. A single position is needed to render each quad, so its easy to do so in an instanced way. (Check the IMPORTANT comment)
 
 **1. Instanced Rendering**
 
