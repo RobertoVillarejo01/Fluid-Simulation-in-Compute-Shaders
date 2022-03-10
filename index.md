@@ -11,6 +11,11 @@
 * i5-6400 CPU
 * GTX960 GPU 
 
+
+Having fun with LaTeX: 
+$$ \frac{1}{2} $$
+
+
 <br>
 
 ## Summary
