@@ -7,6 +7,12 @@
 ![This is a alt text.](/docs/MovingContainer2.gif "Move all around")
 ![This is a alt text.](/docs/ShakeUpAndDown.gif "Shake up and down")
 
+**Disclaimer:** The GIFs above do not have the greatest framerate dute to file sizes and not wanting to make the repo that heavy. The simulations showed (with `40*50*40 = 100k particles`) runs at a stable framerate of 60FPS in a computer with:
+* i5-6400 CPU
+* GTX960 GPU 
+
+<br>
+
 ## Summary
 
 Program built in a C++ Engine from scratch using SDL2, glew, OpenGL, glm and ImGui to name a few.  
@@ -41,7 +47,7 @@ In the images below I am outputting the cell idx as a color in greyscale. As the
 
 
 **1. Memory layout**  
-```
+```glsl
 struct Particle
 {
     vec3  position;
@@ -55,13 +61,13 @@ struct Particle
 
 struct ParticleCellOut {
     uint count;
-    uint offset;
+    uint cell_offset;
     uint _pad1;
     uint _pad2;
 };
 ```
 Three main arrays; **two** for the particle data and **one** for the cell data. We will need two different arrays for particle data in order to use one as input and the other as output in some cases.
-```
+```glsl
 layout (std140, binding = 0) readonly buffer inputFluidData {
    Particle data[];
 } inData;
@@ -83,7 +89,7 @@ We want to generate buffers in such a way that the particle data is directly ava
   
 * Creating the Shader Storage buffers
 
-```
+```c++
 glGenBuffers(2, mFluidData);
 glBindBuffer(GL_SHADER_STORAGE_BUFFER, mFluidData[0]);
 glBufferData(GL_SHADER_STORAGE_BUFFER, mMaxParticles * sizeof(Particle), NULL, GL_STATIC_DRAW);
@@ -96,7 +102,7 @@ glBufferData(GL_SHADER_STORAGE_BUFFER, (mMaxCells+1) * sizeof(unsigned) * 4, NUL
 ```
 
 * Our particle model: A quad (Later detailed)
-```
+```c++
 float particleQuadData[] = {
     -0.5,  0.5, 0.0,
     -0.5, -0.5, 0.0,
@@ -112,7 +118,7 @@ glBufferData(GL_ARRAY_BUFFER, sizeof(particleQuadData), particleQuadData, GL_STA
 
 * Generating the actual meshes & Linking the storage buffers
 
-```
+```c++
 glGenVertexArrays(2, mFluidMesh);
 for (int i = 0; i < 2; i++)
 {
@@ -134,9 +140,9 @@ for (int i = 0; i < 2; i++)
 
 In this project we clearly need a way of subdiving the particles each thread should act on, to maximize spatial coherence and avoid overlap between threads.  
   
-My way to go during the project was the following function. It computes where this instance (this thread) should start and end in an array of length "total_size" so that the workload is evenly distributed for the whole workgroup. It can be found in multiple cmpute shaders but I have copied it here so its easier to see:
+My way to go during the project was the following function. It computes where this instance (this thread) should start and end in an array of length `total_size` so that the workload is evenly distributed for the whole workgroup. It can be found in multiple compute shaders but I have copied it here so its easier to see:
 
-```
+```glsl
 void ComputeBoundary(uint total_size, out uint start, out uint end)
 {
     // There will be partitions with 1 extra elements, this will be placed atan
@@ -182,7 +188,7 @@ Notice here the use of **atomicAdd** (second-to-last line), not only to ensure t
 
 data/fluid_shaders/apply_forces.comp
 
-```
+```glsl
 uint start, end;
 ComputeBoundary(mParticleCount, start, end);
 for (uint i = start; i < end; ++i) 
@@ -202,7 +208,7 @@ for (uint i = start; i < end; ++i)
 
 data/fluid_shaders/compute_offsets.comp
 
-```
+```glsl
 uint start, end;
 ComputeBoundary(mCellCount, start, end);
 for (uint i = start; i < end; ++i) {
@@ -218,7 +224,7 @@ for (uint i = start; i < end; ++i) {
 
 data/fluid_shaders/getneighbors.comp
 
-```
+```glsl
 uint start, end;
 ComputeBoundary(mParticleCount, start, end);
 for (uint i = start; i < end; ++i) 
@@ -243,7 +249,7 @@ Instead of rendering particles, in this project I'm rendering quads. A single po
 
 **1. Instanced Rendering**
 
-```
+```glsl
 glm::mat4 World2View = mCamera.GetWorldToView();
 glm::mat4 World2Proj = mCamera.GetCamToPerspective() * World2View;
 
@@ -264,7 +270,21 @@ glDrawArraysInstanced(GL_TRIANGLES, 0, 6, mParticleCount);
 
 **2. Billboarding**
 
-```
+Billboarding is a really simple concept: Making models (usually planar ones) always face the camera. I am implementing the behavior using billboarding so that these objects get properly scaled based on the perspective matrix while not needing any complicated logic.   
+  
+The main idea behind the implemenation is the following:
+* Extract the Up and Right vectors from the camera (Vectors in world space)
+* We could probably take them as uniforms, but we can also take them form the World to View matrix:
+  *  The reason behind is that rotation matrices can be computed from the orthonormal basis of the space we want to transform onto. 
+  *  Those vectors forming the orthonormal basis will be the columns of the matrix.
+  *  Its easy to see that the standard vectors (1,0,0), (0,1,0) and (0,0,1) will be transformed to the corresponding vectors in the orthonormal basis.
+  *  We can take the Camera's Right and Up vectors from (1,0,0) and (0,1,0), respectively.
+  *  Instead of performing the operations we can directly take the rows.
+  *  Usually, we would be taking the columns, but in OpenGL they stored matrices transposed 
+* Once we have the Up and Right vectors, convert the model space data `aPos` to World space using simple multiplications (`Rotated`). 
+* We can now add the instance data `Rotated + iPos` and transform it again to projected space.
+
+```glsl
 // Extract the necessary vectors from the camera mtx
 vec3 CamRightVec = normalize(vec3(World2View[0][0], World2View[1][0], World2View[2][0]));
 vec3 CamUpVec    = normalize(vec3(World2View[0][1], World2View[1][1], World2View[2][1]));
@@ -279,22 +299,28 @@ gl_Position = World2Proj * vec4(Rotated + iPos, 1.0);
 
 **3. Radius check**
 
-Vertex shader:
-```
-layout (location = 0) in vec3 aPos;    // [-0.5, 0.5]
-out vec2 uvs;
+Finally, we want to avoid the particles looking like squares, so we simply discard the pixels that do not belong to the circle we want to draw.
+
+```glsl
+#version 430
+
+in  vec2 uvs;
+out vec4 outColor;
 
 void main()
 {
-  ...
-  uvs = 2*aPos.xy;
-}
-```
+    // Discard pixels outside the radius (uvs act also as the coordinates in a   
+    // system centered around (0,0) and their range is [-1, 1])
 
-Fragment shader:
-```
-float r2 = dot(uvs, uvs);
-if (r2 > 1.0) discard;
+    // The dot(uvs, uvs) is essentially using the pythagoras theorem to get the 
+    // radius squared. Since we are looking for a radius of 1, we can use the
+    // squared version right away
+    float r2 = dot(uvs, uvs);
+    if (r2 > 1.0) discard;
+    
+    // Output uvs as color for a small effect of shading
+    outColor = vec4(uvs, 0.8, 1);
+}
 ```
 ![This is a alt text.](/docs/RenderingLast.png "Final Result")
 
